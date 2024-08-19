@@ -1,0 +1,252 @@
+---
+title: "Animal Crossing Sentiment Analysis"
+author: "Benard Omido"
+date: "2024-08-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+##### **This project involves building a sentiment analysis model that predicts the rating of an Animal Crossing game based on the reviews given by the users.**
+
+Load the libraries
+```{r}
+library(tidyverse)
+library(tidytext)
+library(tidymodels)
+library(textrecipes)
+```
+
+Load the data
+```{r}
+user_reviews_df <- read_tsv("user_reviews.tsv")
+user_reviews_df
+
+glimpse(user_reviews_df)
+```
+
+
+**Data Exploration**
+```{r}
+user_reviews_df %>% 
+  count(grade) %>% 
+  ggplot(aes(grade, n)) +
+  geom_col()
+```
+
+Most users, 1158, gave a rating of zero while approximately 752 users gave a rating of 10 to the game
+
+Due to the distribution of the data, which makes it difficult to fit regression models,
+I converted the ratings to two classes (Bad reviews when rating <= 6 and Good reviews when rating > 6)
+Fit a classification model
+
+```{r}
+user_reviews_df %>% 
+  filter(grade > 6) %>% 
+  sample_n(5) %>% 
+  pull(text)
+```
+
+There are some repeated chunks of text in the reviews, and also there are some non English reviews
+
+```{r}
+user_reviews_df %>% 
+  filter(grade == 0) %>% 
+  sample_n(5) %>% 
+  pull(text)
+```
+
+**Data Preparation**
+```{r}
+reviews_cleaned <- user_reviews_df %>% 
+  mutate(text = str_remove(text, "Expand$"),
+         rating = case_when(grade > 6 ~ "Good",
+                            TRUE ~ "Bad"))
+```
+
+```{r}
+reviews_cleaned %>% 
+  count(rating)
+```
+
+```{r}
+# Words per review
+word_dist <- reviews_cleaned %>% 
+  unnest_tokens(word, text) %>% 
+  count(user_name, sort = TRUE)
+
+word_dist
+```
+
+```{r}
+# Distribution of the words
+word_dist %>% 
+  ggplot(aes(n)) +
+  geom_histogram()
+```
+
+**Model Building**
+
+```{r}
+# Train and test sets
+set.seed(456)
+review_splits <- initial_split(reviews_cleaned, strata = rating)
+review_train <- training(review_splits)
+review_test <- testing(review_splits)
+```
+
+**Data Preprocessing**
+```{r}
+reviews_rec <- recipe(rating ~ text, data = review_train) %>% 
+  step_tokenize(text) %>% 
+  step_stopwords(text) %>% 
+  step_tokenfilter(text, max_tokens = 800) %>% 
+  step_tfidf(text) %>% 
+  step_normalize(all_predictors())
+
+prep(reviews_rec) %>% bake(new_data = NULL)
+```
+
+**Model specification**
+```{r}
+logistic_spec <- logistic_reg(penalty = tune(), mixture = 1) %>% 
+  set_engine("glmnet")
+
+logistic_spec
+```
+
+**Workflow**
+```{r}
+reviews_wf <- workflow() %>% 
+  add_recipe(reviews_rec) %>% 
+  add_model(logistic_spec)
+
+reviews_wf
+```
+
+**Model Tuning**
+```{r}
+# Create a grid
+penalty()
+lasso_grid <- grid_regular(penalty(), levels = 50)
+lasso_grid
+
+
+# Resampling folds
+set.seed(567)
+review_folds <- bootstraps(review_train, strata = rating)
+review_folds
+
+
+doParallel::registerDoParallel()
+set.seed(783)
+
+reviews_res <- tune_grid(
+  reviews_wf,
+  resamples = review_folds,
+  grid = lasso_grid,
+  metrics = metric_set(roc_auc, accuracy, ppv, npv),
+  control = control_grid(save_pred = TRUE)
+)
+
+reviews_res
+```
+
+```{r}
+reviews_res %>% 
+  collect_metrics()
+```
+
+```{r}
+# Visualization
+reviews_res %>% 
+  collect_metrics() %>% 
+  ggplot(aes(penalty, mean, color = .metric)) +
+  #geom_point() +
+  geom_line(linewidth = 1, show.legend = FALSE) +
+  facet_wrap(~.metric) +
+  scale_x_log10()    # this step is added because penalty is transformed on log10 scale
+```
+
+```{r}
+# Finalize the workflow
+reviews_res %>% 
+  show_best(metric = "roc_auc")
+
+best_res <- reviews_res %>% 
+  select_best(metric = "roc_auc")
+best_res
+
+final_mdl <- finalize_workflow(reviews_wf, best_res)
+final_mdl
+```
+
+```{r}
+# Variable Importance
+library(vip)
+
+rv_fit <- final_mdl %>% 
+  fit(review_train) %>% 
+  pull_workflow_fit()
+
+
+rv_fit %>% 
+  vi(lambda = best_res$penalty) %>% 
+  group_by(Sign) %>% 
+  top_n(20, wt = abs(Importance)) %>% 
+  ungroup() %>% 
+  mutate(Importance = abs(Importance),
+         Variable = str_remove(Variable, "tfidf_text_"),
+         Variable = fct_reorder(Variable, Importance)) %>% 
+  ggplot(aes(Importance, Variable, fill = Sign)) +
+  geom_col() +
+  facet_wrap(~Sign, scales = "free_y")
+```
+
+```{r}
+# Evaluating Model performance
+
+review_final <- last_fit(final_mdl, review_splits)
+review_final
+
+review_final %>% 
+  collect_metrics()
+```
+
+Results in a better roc_auc, indicating there was no over fitting
+
+```{r}
+review_final %>% 
+  collect_predictions() %>% 
+  conf_mat(rating, .pred_class)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
