@@ -1,0 +1,343 @@
+---
+title: "Animal Crossing Game Sentiment Analysis"
+format: html
+editor: visual
+---
+
+This project focuses on building a sentiment analysis model to predict user ratings for the popular game Animal Crossing based on user reviews. It employs a deep learning approach using a Long Short-Term Memory (LSTM) network, a type of recurrent neural network (RNN) designed to process sequential data effectively.
+
+LSTMs are particularly well-suited for text-based tasks due to their ability to handle long sequences of words or characters while capturing dependencies within the text. Their feedback loops and memory cells enable them to learn to "remember" and "forget" information, making them powerful for modeling linguistic structures.
+
+Given the limited size of the dataset (2999 rows), cross-validation with multiple folds will be used to reliably assess the model's performance while minimizing overfitting. After identifying the optimal hyperparameters, a final model will be trained on the complete training set and evaluated on the test set to measure its predictive accuracy.
+
+```{r, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(tidymodels)
+library(keras)
+```
+
+```{r, message=FALSE}
+# Load data
+user_reviews <- read_tsv("user_reviews.tsv")
+glimpse(user_reviews)
+```
+
+**Exploratory Analysis**
+
+```{r}
+user_reviews %>% 
+  count(user_name, text)   # There are 2999 distinct users, with each user giving one review
+
+user_reviews %>% 
+  summarize(avg_grade = mean(grade))    # The average rating given  = 4.22
+
+```
+
+```{r}
+# User Ratings
+user_reviews %>% 
+  count(grade) %>% 
+  ggplot(aes(factor(grade), n)) +
+  geom_col(aes(fill = "firebrick")) +
+  theme_minimal() +
+  theme(legend.position = "none") +
+  labs(
+    title = "Number of Ratings for the Animal Crossing Game",
+    subtitle = "(Majority of the users gave a rating of 0)",
+    x = "Grade (Rating)",
+    y = "Frequency"
+  )
+
+# Majority of the users gave a rating of 0, closely followed by 10, 1 and 9
+```
+
+```{r}
+# Character lengths of the reviews
+user_reviews %>% 
+  ggplot(aes(nchar(text))) +
+  geom_histogram(alpha = 0.7, fill = "firebrick") +
+  scale_x_log10() +
+  labs(
+    x = "Number of characters per review",
+    y = "Number of reviews"
+  )
+
+# The distribution appears odd, the data has two thresholds. Nearly half of the reviews have a character length < 400 while the other half have a character length > 800
+```
+
+```{r}
+# Diving deeper into the data to check if there's a reason behind the odd distribution
+user_reviews %>% 
+  filter(nchar(text) < 400) %>% 
+  sample_n(5) %>% 
+  pull(text)
+
+# Majority of the reviews with less than 500 characters appear coherent, some even end with full stops
+
+
+user_reviews %>% 
+  filter(nchar(text) >= 800) %>% 
+  sample_n(5) %>% 
+  pull(text)
+
+# Reviews with more than 800 characters also appear coherent.
+```
+
+**Data Preparation**
+
+```{r}
+# The data contains 11 different ratings (from 0 to 10). Since the data has an odd distribution which makes it difficult to fit regression models, the ratings are converted to two classes (Bad reviews when the rating <= 6 and Good reviews when the rating > 6)
+
+set.seed(456)
+reviews <- user_reviews %>%
+  mutate(
+    text = str_remove(text, "Expand$"),
+    rating = if_else(grade > 6, 1, 0)  # Good (1) and Bad (0)
+  )
+```
+
+```{r, message=FALSE, warning=FALSE}
+library(tokenizers)
+library(textrecipes)
+library(tidytext)
+
+# Number of words per review
+p <- user_reviews %>% 
+  mutate(n_words = count_words(text)) %>% 
+  filter(n_words > 10) %>% 
+ ggplot(aes(n_words)) +
+  geom_histogram(fill = "firebrick", color = "white") +
+  scale_x_continuous(breaks = c(0, 100, 200, 300, 400, 500, 600, 700, 800), limits = c(10, 750)) +
+  labs(x = "Number of words per campaign blurb",
+       y = "Number of campaign blurbs")
+
+plotly::ggplotly(p)
+
+# Reviews with less than 10 words are removed since most of them are incomplete sentences
+# The histogram indicates majority of the reviews have between 25 - 230 words
+```
+
+```{r}
+# Most common words
+most_common_words <- user_reviews %>% 
+  unnest_tokens(word, text) %>% 
+  count(word, sort = TRUE) %>%      # stop words are the most common words
+  anti_join(stop_words) %>% 
+  slice_max(n, n = 800)     # After removal of stop words, the most common words are game, island, switch,play and player
+
+# I retain only the top 800 words since the user reviews data set doesn't contain a big word vocabulary, this is to avoid a highly sparse matrix during model building
+
+most_common_words
+
+most_common_words %>% 
+  arrange(n)
+```
+
+**Model Definition**
+
+```{r}
+max_words <- 800
+max_length <- 200
+output_dim <- 16
+
+set.seed(456)
+reviews <- reviews %>% 
+  mutate(n_words = count_words(text)) %>% 
+  filter(n_words > 10)
+
+# Data splitting
+
+review_splits <- initial_split(reviews, strata = rating)
+review_train <- training(review_splits)
+review_test <- testing(review_splits)
+
+```
+
+
+```{r}
+# Recipe
+reviews_rec <- recipe(~ text, data = review_train) %>%
+  step_tokenize(text) %>%
+  step_stopwords(text) %>%
+  step_tokenfilter(text, max_tokens = max_words) %>%
+  step_sequence_onehot(text, sequence_length = max_length)
+
+
+# Prep the recipe
+reviews_prep <- prep(reviews_rec)
+```
+
+
+```{r}
+# Cross validation folds
+set.seed(456)
+review_folds <- vfold_cv(review_train, v = 5, strata = rating)
+```
+
+
+```{r}
+# Preprocessing and model fitting function
+fit_split <- function(split, prepped_rec) {
+  
+  x_train <- bake(prepped_rec, new_data = analysis(split), composition = "matrix")
+  x_val <- bake(prepped_rec, new_data = assessment(split), composition = "matrix")
+  
+  # Get outcomes
+  y_train <- analysis(split) %>% pull(rating)
+  y_val <- assessment(split) %>% pull(rating)
+  
+  # Create and compile model
+  model <- keras_model_sequential() %>%
+    layer_embedding(input_dim = max_words + 1, output_dim = output_dim) %>%
+    bidirectional(
+      layer_lstm(units = 16, dropout = 0.5, recurrent_dropout = 0.5)
+      ) %>%
+    layer_dense(units = 1, activation = "sigmoid") %>%
+    compile(
+      optimizer = "adam",
+      loss = "binary_crossentropy",
+      metrics = c("accuracy")
+    )
+  
+  # Fit model
+  history <- model %>% fit(
+    x_train, y_train,
+    epochs = 15,
+    validation_data = list(x_val, y_val),
+    batch_size = 64,
+    verbose = FALSE
+  )
+  
+  # Get predictions
+  val_pred <- predict(model, x_val)
+  val_pred_class <- ifelse(val_pred > 0.5, 1, 0)
+  
+  # Calculate metrics
+  accuracy <- mean(val_pred_class == y_val)
+  precision <- sum(val_pred_class == 1 & y_val == 1) / sum(val_pred_class == 1)
+  recall <- sum(val_pred_class == 1 & y_val == 1) / sum(y_val == 1)
+  f1 <- 2 * (precision * recall) / (precision + recall)
+  
+  # Return metrics
+  tibble(
+    accuracy = accuracy,
+    precision = precision,
+    recall = recall,
+    f1_score = f1
+  )
+}
+```
+
+
+```{r, message=FALSE, warning=FALSE}
+# Apply cross-validation using map()
+cv_results <- review_folds %>%
+  mutate(
+    metrics = map(splits, fit_split, reviews_prep))
+```
+
+```{r}
+cv_results %>% 
+  unnest(metrics)
+
+
+cv_results %>% 
+  unnest(metrics) %>% 
+  summarize(
+    avg_accuracy = mean(accuracy)
+  )
+
+```
+
+The cross validation folds have an average accuracy = 87.17%.
+
+**Final Model**
+
+```{r}
+review_baked <- bake(reviews_prep, new_data = NULL, composition = "matrix")
+
+
+final_model <- keras_model_sequential() %>%
+  layer_embedding(input_dim = max_words + 1, output_dim = output_dim) %>%
+  bidirectional(
+    layer_lstm(units = 16, dropout = 0.5, recurrent_dropout = 0.5)
+  ) %>%
+  layer_dense(units = 1, activation = "sigmoid") %>%
+  compile(
+    optimizer = "adam",
+    loss = "binary_crossentropy",
+    metrics = c("accuracy")
+  )
+
+
+# Fit the model
+history <- final_model %>% fit(
+  review_baked,
+  review_train$rating,
+  epochs = 15,
+  batch_size = 64,
+  verbose = FALSE
+)
+
+history
+
+plot(history)
+```
+
+The final model achieves impressive results: Loss = 0.1713 and accuracy = 93.93%.
+
+**Model Evaluation**
+
+```{r}
+# Evaluate model on test set
+
+test_baked <- bake(reviews_prep, new_data = review_test, composition = "matrix")
+
+mod_evaluation <- evaluate(final_model, 
+         x = test_baked,
+         y = review_test$rating)
+
+mod_evaluation
+
+```
+
+The performance on the test set indicates that the model achieved a loss of 0.2963 and an accuracy of 88.62%, which is slightly lower than the training performance (loss: 0.1713, accuracy: 93.92%). This gap suggests the model generalizes well to unseen data, but there may still be some overfitting or room for improvement in capturing the nuances of the test set.
+
+The results are promising given the small dataset size (2999 rows) and highlight the effectiveness of using LSTMs for sentiment analysis.
+
+**Predictions**
+
+```{r}
+test_pred <- predict(final_model, test_baked)
+test_pred_class <- ifelse(test_pred > 0.5, 1, 0)
+
+# Calculate final test metrics
+test_metrics <- tibble(
+  accuracy = mean(test_pred_class == review_test$rating),
+  precision = sum(test_pred_class == 1 & review_test$rating == 1) / sum(test_pred_class == 1),
+  recall = sum(test_pred_class == 1 & review_test$rating == 1) / sum(review_test$rating == 1),
+  f1_score = 2 * (precision * recall) / (precision + recall)
+)
+
+test_metrics
+
+
+# Confusion matrix
+conf_mat <- table(Predicted = test_pred_class, Actual = review_test$rating)
+conf_mat
+```
+
+From the confusion matrix:
+
+The model correctly identified 239 good reviews (True Positives).
+
+The model correctly identified 423 bad reviews (True Negatives).
+
+The model incorrectly classified 43 bad reviews as good reviews (False Positives).
+
+The model incorrectly classified 42 good reviews as bad reviews (False Negatives).
+
+
+
+
+
